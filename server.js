@@ -7,6 +7,9 @@ const path = require('path');
 const qrcode = require('qrcode'); // Added for dynamic Base64 QR rendering
 require('dotenv').config();
 
+// FORCE ENTIRE SERVER NATIVELY INTO INDIAN STANDARD TIME (IST)
+process.env.TZ = "Asia/Kolkata";
+
 const app = express();
 
 // ==========================================
