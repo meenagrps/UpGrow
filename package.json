@@ -1,0 +1,20 @@
+{
+  "name": "meena-groups-admin-backend",
+  "version": "1.0.0",
+  "description": "Admin Server for Meena Groups via Hugging Face",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "cors": "2.8.5",
+    "dotenv": "16.4.5",
+    "express": "5.0.1",
+    "firebase-admin": "13.8.0",
+    "node-cron": "3.0.3",
+    "pino": "^9.0.0",
+    "puppeteer": "^24.4.0",
+    "qrcode": "^1.5.3"
+  }
+}
