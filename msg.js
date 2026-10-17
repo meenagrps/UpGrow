@@ -9,7 +9,7 @@ if (!LINKING_PHONE_NUMBER) {
     console.error("⚠️ [WARNING] 'PHONE' secret is missing!");
 }
 
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const admin = require('firebase-admin');
 const cron = require('node-cron');
@@ -61,16 +61,32 @@ setInterval(() => {
     console.log("🧹 Cleared processedDocs cache to free memory.");
 }, 12 * 60 * 60 * 1000); 
 
+// --- ADVANCED EDGE-CASE HELPERS: CONNECTION LOCK & WAIT FOR SOCKET ---
+let isStartingClient = false;
+let reconnectTimeout = null;
+let badSessionStrikeCount = 0;
+const MAX_BAD_SESSION_STRIKES = 4;
+
+async function waitForSocketOpen(maxWaitMs = 15000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+        if (global.isSocketConnected && activeSocket) return activeSocket;
+        await sleep(500);
+    }
+    return activeSocket;
+}
+
 // --- FIX: UNIVERSAL SAFE SENDING HELPER (BAILEYS EDITION) ---
 async function safeSendMessage(sock, jid, message, agentName) {
+    const liveSock = (global.isSocketConnected && activeSocket) ? activeSocket : await waitForSocketOpen(12000) || sock;
     try {
         // 1. Resolve the correct WhatsApp ID securely via Baileys
         let plainPhone = String(jid).replace(/\D/g, '');
-        const results = await sock.onWhatsApp(plainPhone);
+        const results = await liveSock.onWhatsApp(plainPhone);
         const finalId = (results && results.length > 0) ? results[0].jid : `${plainPhone}@s.whatsapp.net`;
 
         // 2. Direct Send (Works instantly even if the chat isn't in recent memory)
-        await sock.sendMessage(finalId, { text: message });
+        await liveSock.sendMessage(finalId, { text: message });
         console.log(`✅ Message successfully sent to ${agentName || jid}`);
         return true;
         
@@ -80,7 +96,7 @@ async function safeSendMessage(sock, jid, message, agentName) {
             let fallbackId = String(jid).replace('@c.us', '@s.whatsapp.net');
             if (!fallbackId.includes('@s.whatsapp.net')) fallbackId = fallbackId.replace(/\D/g, '') + '@s.whatsapp.net';
             
-            await sock.sendMessage(fallbackId, { text: message });
+            await liveSock.sendMessage(fallbackId, { text: message });
             console.log(`✅ Message successfully sent to ${agentName || jid} (via fallback)`);
             return true;
         } catch (finalErr) {
@@ -168,24 +184,64 @@ const getBrowserPath = () => {
 let connectionRetries = 0;
 const MAX_RETRIES = 10;
 
+function scheduleSafeReconnect(delayMs) {
+    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    reconnectTimeout = setTimeout(() => {
+        reconnectTimeout = null;
+        startWhatsAppClient();
+    }, delayMs);
+}
+
 async function startWhatsAppClient() {
+    if (isStartingClient) {
+        console.log("⏳ [GUARD] WhatsApp Client boot already in progress. Skipping duplicate call...");
+        return;
+    }
+    isStartingClient = true;
+
     console.log(`🚀 Booting Baileys WhatsApp Client (Attempt ${connectionRetries + 1}/${MAX_RETRIES})...`);
     if (connectionRetries >= MAX_RETRIES) {
-        console.error("❌ CRITICAL: Maximum connection retries exceeded.");
-        process.exit(1);
+        console.error("❌ CRITICAL: Maximum connection retries exceeded. Resetting retry counter for cool-down recovery instead of crashing...");
+        connectionRetries = 0;
+        isStartingClient = false;
+        scheduleSafeReconnect(60000);
+        return;
     }
     
     try {
+        // Safely clean up any dangling previous socket listeners before creating a new socket
+        if (activeSocket) {
+            try {
+                activeSocket.ev.removeAllListeners('connection.update');
+                activeSocket.ev.removeAllListeners('creds.update');
+                activeSocket.end(undefined);
+            } catch (cleanupErr) {}
+        }
+
         const { state, saveCreds } = await useMultiFileAuthState('whatsapp-session-baileys');
+        const silentLogger = pino({ level: 'silent' });
         
         const sock = makeWASocket({
-            auth: state,
-            logger: pino({ level: 'silent' }), 
+            auth: {
+                creds: state.creds,
+                // Cache Signal keys in memory to prevent slow disk I/O 'Stream Errored (ack)' (Status 500) on Render Free Tier
+                keys: typeof makeCacheableSignalKeyStore === 'function'
+                    ? makeCacheableSignalKeyStore(state.keys, silentLogger)
+                    : state.keys
+            },
+            logger: silentLogger, 
             browser: Browsers.macOS('Desktop'),
-            printQRInTerminal: false
+            printQRInTerminal: false,
+            keepAliveIntervalMs: 25000,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            retryRequestDelayMs: 2000,
+            markOnlineOnConnect: false,
+            syncFullHistory: false
         });
 
         activeSocket = sock;
+        isStartingClient = false;
 
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect, qr } = update;
@@ -201,33 +257,78 @@ async function startWhatsAppClient() {
                 global.lastConnectedTimestamp = 0;
                 
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const isFatal = statusCode === DisconnectReason.loggedOut || statusCode === 500 || statusCode === 401 || statusCode === 403;
+                const errorMessage = lastDisconnect?.error?.message || '';
+
+                // Track consecutive 500 (badSession / Stream Errored) strikes in case session files are genuinely corrupted
+                if (statusCode === 500 || statusCode === DisconnectReason.badSession) {
+                    badSessionStrikeCount++;
+                } else {
+                    badSessionStrikeCount = 0;
+                }
+
+                // ONLY treat explicit logouts (401), forbidden (403), multidevice mismatch (411), or repeated unrecoverable 500 loops as fatal
+                const isFatal = 
+                    statusCode === DisconnectReason.loggedOut || 
+                    statusCode === 401 || 
+                    statusCode === 403 || 
+                    statusCode === DisconnectReason.multideviceMismatch ||
+                    (statusCode === 500 && badSessionStrikeCount >= MAX_BAD_SESSION_STRIKES);
                 
                 console.log('❌ WhatsApp Disconnected. Reason:', lastDisconnect?.error, 'Status:', statusCode);
                 
                 if (!isFatal) {
+                    // Edge Case 1: QR Code timed out (Status 408) while waiting for scan - don't burn retry attempts
+                    if (statusCode === DisconnectReason.timedOut || statusCode === 408 || errorMessage.includes('QR refs attempts ended')) {
+                        console.log('⏳ QR/Connection timed out (408). Refreshing socket cleanly without burning retry limit...');
+                        scheduleSafeReconnect(5000);
+                        return;
+                    }
+
+                    // Edge Case 2: Connection Replaced (Status 440) - Another instance took over; wait longer to avoid conflict loop
+                    if (statusCode === DisconnectReason.connectionReplaced || statusCode === 440) {
+                        console.warn('⚠️ Connection replaced by another instance (Status 440). Backing off for 45s...');
+                        scheduleSafeReconnect(45000);
+                        return;
+                    }
+
+                    // Edge Case 3: Stream Errored (ack) (Status 500) or Restart Required (Status 515) - Fast reconnect with existing creds
+                    if (statusCode === 500 || statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+                        console.log(`🔄 Stream/Restart disconnect (Status ${statusCode}, Strike ${badSessionStrikeCount}/${MAX_BAD_SESSION_STRIKES}). Reconnecting quickly without wiping session...`);
+                        connectionRetries++;
+                        scheduleSafeReconnect(3500);
+                        return;
+                    }
+
+                    // Standard transient network disconnect backoff
                     connectionRetries++;
                     const retryDelay = Math.min(15000 * connectionRetries, 60000); 
-                    setTimeout(startWhatsAppClient, retryDelay);
+                    console.log(`🔄 Temporary disconnect (Status ${statusCode}). Reconnecting in ${retryDelay / 1000}s...`);
+                    scheduleSafeReconnect(retryDelay);
                 } else {
                     console.log('⚠️ Session expired or logged out. Requesting new QR...');
+                    badSessionStrikeCount = 0;
                     global.isSessionExpired = true;
                     global.sessionExpiredMessage = "Your WhatsApp session was logged out. Please link again.";
                     global.hasTriedRootBackup = true;
                     global.globalQRString = null;
 
-                    fs.rmSync('./whatsapp-session-baileys', { recursive: true, force: true });
+                    try {
+                        fs.rmSync('./whatsapp-session-baileys', { recursive: true, force: true });
+                    } catch (rmErr) {
+                        console.error('⚠️ Failed to remove session directory:', rmErr.message);
+                    }
                     try {
                         const backupPath = path.join(__dirname, 'whatsapp-session.json');
                         if (fs.existsSync(backupPath)) fs.rmSync(backupPath, { force: true });
                     } catch (e) {}
 
                     connectionRetries = 0;
-                    setTimeout(startWhatsAppClient, 2000);
+                    scheduleSafeReconnect(2000);
                 }
             } else if (connection === 'open') {
                 console.log('✅ WhatsApp Web Client is READY and CONNECTED!');
                 connectionRetries = 0;
+                badSessionStrikeCount = 0;
                 global.isSocketConnected = true;
                 global.globalQRString = null;
                 global.isSessionExpired = false;
@@ -259,13 +360,20 @@ async function startWhatsAppClient() {
             }
         });
 
-        sock.ev.on('creds.update', saveCreds);
+        sock.ev.on('creds.update', async () => {
+            try {
+                await saveCreds();
+            } catch (credErr) {
+                console.error("⚠️ Failed to save Baileys credentials:", credErr.message);
+            }
+        });
 
     } catch (err) {
+        isStartingClient = false;
         console.error("❌ WhatsApp Engine Failed to Start:", err.message);
         connectionRetries++;
         const retryDelay = Math.min(15000 * connectionRetries, 60000); 
-        setTimeout(startWhatsAppClient, retryDelay);
+        scheduleSafeReconnect(retryDelay);
     }
 }
 startWhatsAppClient();
@@ -333,7 +441,7 @@ function setupScheduledJobs() {
                 
                 const data = doc.data();
                 Object.keys(data).forEach(key => {
-                    if (key !== 'activeCustomers' && data[key].status === 'pending') {
+                    if (key !== 'activeCustomers' && data[key] && data[key].status === 'pending') {
                         if (!agentStats[uid]) agentStats[uid] = { count: 0, totalAmount: 0 };
                         agentStats[uid].count++;
                         agentStats[uid].totalAmount += parseFloat(data[key].amount || 0);
@@ -382,7 +490,7 @@ function setupFirestoreListener() {
                 const uid = change.doc.id.split('_')[0];
                 
                 Object.keys(data).forEach(key => {
-                    if (key !== 'activeCustomers' && data[key].status === 'submitted') {
+                    if (key !== 'activeCustomers' && data[key] && data[key].status === 'submitted') {
                         const uniqueId = `${change.doc.id}_${key}`; // Ensure we only message once per submitted item
                         if (processedDocs.has(uniqueId)) return;
                         processedDocs.add(uniqueId);
@@ -433,6 +541,6 @@ module.exports = {
         try { if (fs.existsSync('qr-code.png')) fs.unlinkSync('qr-code.png'); } catch (fsErr) {}
         
         fs.rmSync('./whatsapp-session-baileys', { recursive: true, force: true });
-        setTimeout(startWhatsAppClient, 2000);
+        scheduleSafeReconnect(2000);
     }
 };
