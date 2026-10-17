@@ -9,7 +9,7 @@ if (!LINKING_PHONE_NUMBER) {
     console.error("⚠️ [WARNING] 'PHONE' secret is missing!");
 }
 
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, makeCacheableSignalKeyStore, isJidBroadcast } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const admin = require('firebase-admin');
 const cron = require('node-cron');
@@ -22,6 +22,45 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('uncaughtException', (err) => {
     console.error('⚠️ [ANTI-CRASH] Uncaught Exception:', err);
 });
+
+// ADVANCED FIX: Silence hardcoded console.error / console.warn / console.log spam from internal libsignal decryption retries
+const LIBSIGNAL_SPAM_PATTERNS = [
+    'Bad MAC',
+    'Failed to decrypt message with any known session',
+    'Session error:',
+    'verifyMAC',
+    'doDecryptWhisperMessage',
+    'decryptWithSessions',
+    '_asyncQueueExecutor',
+    'Closing open session in favor of incoming prekey bundle'
+];
+
+function isLibsignalSpam(args) {
+    try {
+        const msg = args.map(a => (typeof a === 'string' ? a : (a?.stack || a?.message || ''))).join(' ');
+        return LIBSIGNAL_SPAM_PATTERNS.some(pattern => msg.includes(pattern));
+    } catch (e) {
+        return false;
+    }
+}
+
+const origConsoleError = console.error;
+console.error = function (...args) {
+    if (isLibsignalSpam(args)) return;
+    origConsoleError.apply(console, args);
+};
+
+const origConsoleWarn = console.warn;
+console.warn = function (...args) {
+    if (isLibsignalSpam(args)) return;
+    origConsoleWarn.apply(console, args);
+};
+
+const origConsoleLog = console.log;
+console.log = function (...args) {
+    if (isLibsignalSpam(args)) return;
+    origConsoleLog.apply(console, args);
+};
 
 // ==========================================
 // 🔥 FIREBASE INIT (JSON File Support for msg.js)
@@ -60,6 +99,17 @@ setInterval(() => {
     processedDocs.clear();
     console.log("🧹 Cleared processedDocs cache to free memory.");
 }, 12 * 60 * 60 * 1000); 
+
+// --- LIGHTWEIGHT IN-MEMORY MESSAGE CACHE FOR MULTI-DEVICE RETRY HANDSHAKES ---
+const recentSentMessagesCache = new Map();
+function cacheMessageForRetry(key, messageContent) {
+    if (!key || !key.id || !messageContent) return;
+    recentSentMessagesCache.set(key.id, messageContent);
+    if (recentSentMessagesCache.size > 500) {
+        const oldestKey = recentSentMessagesCache.keys().next().value;
+        recentSentMessagesCache.delete(oldestKey);
+    }
+}
 
 // --- ADVANCED EDGE-CASE HELPERS: CONNECTION LOCK & WAIT FOR SOCKET ---
 let isStartingClient = false;
@@ -214,6 +264,8 @@ async function startWhatsAppClient() {
             try {
                 activeSocket.ev.removeAllListeners('connection.update');
                 activeSocket.ev.removeAllListeners('creds.update');
+                activeSocket.ev.removeAllListeners();
+                if (activeSocket.ws) activeSocket.ws.close();
                 activeSocket.end(undefined);
             } catch (cleanupErr) {}
         }
@@ -230,14 +282,45 @@ async function startWhatsAppClient() {
                     : state.keys
             },
             logger: silentLogger, 
-            browser: Browsers.macOS('Desktop'),
+            browser: Browsers.ubuntu('Chrome'), // Distinct browser fingerprint for Bot 2 (Original: Browsers.macOS('Desktop'))
             printQRInTerminal: false,
             keepAliveIntervalMs: 25000,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
             retryRequestDelayMs: 2000,
+            maxMsgRetryCount: 5,
             markOnlineOnConnect: false,
-            syncFullHistory: false
+            syncFullHistory: false,
+            // ADVANCED FIX 1: Ignore status broadcasts & newsletters that trigger Bad MAC loops across multiple linked bots
+            shouldIgnoreJid: (jid) => isJidBroadcast(jid) || (typeof jid === 'string' && (jid.includes('broadcast') || jid.endsWith('@newsletter'))),
+            // ADVANCED FIX 2: Fulfill retry handshakes when companion devices/bots desync on Signal ratchets
+            getMessage: async (key) => {
+                if (key?.id && recentSentMessagesCache.has(key.id)) {
+                    return recentSentMessagesCache.get(key.id);
+                }
+                return { conversation: '' };
+            }
+        });
+
+        // Wrap sendMessage to automatically cache outgoing messages for multi-device retry requests
+        const origSendMessage = sock.sendMessage.bind(sock);
+        sock.sendMessage = async (jid, content, options) => {
+            const sentMsg = await origSendMessage(jid, content, options);
+            if (sentMsg?.key && sentMsg?.message) {
+                cacheMessageForRetry(sentMsg.key, sentMsg.message);
+            }
+            return sentMsg;
+        };
+
+        // Cache incoming/synced messages for retry handshakes
+        sock.ev.on('messages.upsert', ({ messages }) => {
+            if (Array.isArray(messages)) {
+                for (const m of messages) {
+                    if (m?.key && m?.message) {
+                        cacheMessageForRetry(m.key, m.message);
+                    }
+                }
+            }
         });
 
         activeSocket = sock;
@@ -276,6 +359,13 @@ async function startWhatsAppClient() {
                 
                 console.log('❌ WhatsApp Disconnected. Reason:', lastDisconnect?.error, 'Status:', statusCode);
                 
+                // Cleanly destroy the closed socket instance to prevent ghost listeners and overlapping file writes
+                try {
+                    sock.ev.removeAllListeners();
+                    if (sock.ws) sock.ws.close();
+                    sock.end(undefined);
+                } catch (e) {}
+
                 if (!isFatal) {
                     // Edge Case 1: QR Code timed out (Status 408) while waiting for scan - don't burn retry attempts
                     if (statusCode === DisconnectReason.timedOut || statusCode === 408 || errorMessage.includes('QR refs attempts ended')) {
@@ -384,6 +474,7 @@ setInterval(async () => {
         const memoryUsage = process.memoryUsage().heapUsed / 1024 / 1024;
         if (memoryUsage > 450) {
             console.log(`⚠️ High Memory Detected (${Math.round(memoryUsage)}MB). Purging WhatsApp caches...`);
+            recentSentMessagesCache.clear();
             if (global.gc) {
                 global.gc();
             }
@@ -537,7 +628,20 @@ function setupFirestoreListener() {
 
 module.exports = {
     restartClient: async () => {
-        try { if (activeSocket) activeSocket.end(undefined); } catch(e) {}
+        badSessionStrikeCount = 0;
+        connectionRetries = 0;
+        isStartingClient = false;
+        if (reconnectTimeout) {
+            clearTimeout(reconnectTimeout);
+            reconnectTimeout = null;
+        }
+        try {
+            if (activeSocket) {
+                activeSocket.ev.removeAllListeners();
+                if (activeSocket.ws) activeSocket.ws.close();
+                activeSocket.end(undefined);
+            }
+        } catch(e) {}
         try { if (fs.existsSync('qr-code.png')) fs.unlinkSync('qr-code.png'); } catch (fsErr) {}
         
         fs.rmSync('./whatsapp-session-baileys', { recursive: true, force: true });
